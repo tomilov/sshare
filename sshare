@@ -1,0 +1,70 @@
+#!/bin/bash
+
+set -o errexit
+set -o pipefail
+set -o nounset
+
+version=1
+OPTIND=1
+verbose=0
+mode="add"
+
+while getopts ":vasl" opt ; do
+	case "$opt" in
+		\?)	echo "error: invalid option: -$OPTARG" >&2 ; exit 1
+			;;
+		:)	echo "error: option -$OPTARG requires an argument" >&2 ; exit 1
+			;;
+		v)	let "verbose++" ; echo "verbosity increased"
+			;;
+		a)	mode="add"
+			;;
+		s)	mode="save"
+			;;
+		l)	mode="load"
+			;;
+	esac
+done
+shift $((OPTIND-1))
+files=("$@")
+echo "mode: $mode"
+
+[[ "${#files[@]}" != 0 ]] || { echo "list of files to process is empty" >&2 ; exit 1 ; }
+
+if [[ $mode == "add" ]] ; then
+	for file in "${files[@]}" ; do
+		[[ -e $file ]] && cp "$file" "${file}.bak" || touch "$file"
+		sshare_file="${file}.sshare"
+		[[ -e $sshare_file ]] || { echo "$version" > "$sshare_file" ; git add --intent-to-add "$sshare_file" ; echo "$file" >> .gitignore ; echo "${file}.bak" >> .gitignore ; git add .gitignore ; }
+	done
+	exit 0
+fi
+tmp_dir=`mktemp --tmpdir -d sshare.XXXX`
+read -r -s -p "enter password to $mode tracked files:" sshare_password && echo ;
+for file in "${files[@]}" ; do
+	[[ ! -e $file ]] && touch "$file" || cp "$file" "${file}.bak"
+	sshare_file="${file}.sshare"
+	[[ -r $sshare_file ]] || { echo "warning: can't read file $sshare_file (file '$file' skipped)" >&2 ; continue ; }
+	file_version=$(head -1 "$sshare_file")
+	[[ "$file_version" == $version ]] || { echo "warning: version '$file_version' of '$sshare_file' file differs from version '$version' of script (file '$file' skipped)" >&2 ; continue ; }
+	tmp_file="$tmp_dir/$file"
+	> "$tmp_file"
+	line_number=0
+	tail --lines=+2 "$sshare_file" | while IFS= read -r line ; do
+		let "line_number++" || :
+		[[ -n $line ]] || { echo "warning: empty line encountered at #$line_number" >&2 ; continue ; }
+		echo "$line" | openssl enc -d -A -base64 -aes256 -k "$sshare_password" | gunzip --to-stdout --force | patch "$tmp_file" --normal --quiet
+	done
+	if [[ $mode == "load" ]] ; then
+		cp -f "$tmp_file" . || { echo "warning: can't update file '$file' (file write-protected)" >&2 ; continue ; }
+	fi
+	if [[ $mode == "save" ]] ; then
+			chunk=$(diff "$tmp_file" "$file" || :)
+			[[ -n $chunk ]] || { echo "file '$file' not changed" ; continue ; }
+			[[ -w $sshare_file ]] || { echo "warning: can't update sshare database '$sshare_file' (file write protected) (saving of file '$file' skipped)" ; continue ; }
+			echo "$chunk" | gzip --stdout | openssl enc -e -A -base64 -aes256 -k "$sshare_password" >> "$sshare_file"
+			echo >> "$sshare_file"
+
+	fi
+done
+
